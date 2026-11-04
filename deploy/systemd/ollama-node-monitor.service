@@ -1,0 +1,39 @@
+[Unit]
+Description=Monitor de modelos do Ollama com avisos no Telegram
+Documentation=https://github.com/BigLeno/ollama-node-monitor
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# O systemd lê a configuração como root antes de trocar de usuário,
+# então o arquivo pode ficar com permissão 600 (ele contém o token do Telegram).
+EnvironmentFile=/etc/ollama-node-monitor/config.env
+ExecStart=/usr/local/bin/ollama-node-monitor
+Restart=on-failure
+RestartSec=10
+
+# Roda com um usuário temporário, sem privilégios, criado pelo systemd.
+DynamicUser=yes
+StateDirectory=ollama-node-monitor
+# Para gravar métricas no textfile collector, libere a pasta:
+#ReadWritePaths=/var/lib/node_exporter/textfile_collector
+
+# Endurecimento
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

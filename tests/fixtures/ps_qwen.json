@@ -1,0 +1,1 @@
+{"models":[{"name":"qwen2.5:7b","model":"qwen2.5:7b","size":6000000000,"digest":"845dbda0ea48","details":{"parameter_size":"7.6B","quantization_level":"Q4_K_M"},"expires_at":"2026-11-04T20:06:00-03:00","size_vram":3600000000}]}

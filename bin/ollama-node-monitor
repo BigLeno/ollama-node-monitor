@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# ollama-node-monitor: avisa no Telegram quando modelos do Ollama são carregados ou descarregados
+# e exporta métricas no formato do Prometheus (textfile collector do node_exporter).
+#
+# Uso: ollama-node-monitor [--once] [--config ARQUIVO] [--version] [--help]
+
+set -euo pipefail
+# No bash 5.2+, "&" na substituição ${var//x/y} passou a significar "o trecho encontrado".
+# Desligar mantém o comportamento igual em todas as versões (no 4.x a opção não existe).
+shopt -u patsub_replacement 2>/dev/null || true
+
+readonly VERSION="2.0.0"
+
+# ——— Configuração (variáveis de ambiente ou arquivo passado em --config) ———
+load_defaults() {
+  OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+  POLL_INTERVAL="${POLL_INTERVAL:-30}"
+  REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-5}"
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+  TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+  TELEGRAM_API_URL="${TELEGRAM_API_URL:-https://api.telegram.org}"
+  NODE_NAME="${NODE_NAME:-$(hostname)}"
+  # O systemd define STATE_DIRECTORY quando a unit usa StateDirectory=.
+  STATE_DIR="${STATE_DIR:-${STATE_DIRECTORY:-/var/lib/ollama-node-monitor}}"
+  METRICS_FILE="${METRICS_FILE:-}"
+  NOTIFY_API_DOWN="${NOTIFY_API_DOWN:-true}"
+  PROXMOX_CTID="${PROXMOX_CTID:-$(detect_proxmox_ctid)}"
+}
+
+validate_config() {
+  [[ "$POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "POLL_INTERVAL deve ser um inteiro positivo (recebido: '$POLL_INTERVAL')."
+  [[ "$REQUEST_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "REQUEST_TIMEOUT deve ser um inteiro positivo."
+  [[ "$OLLAMA_URL" =~ ^https?:// ]] || die "OLLAMA_URL deve começar com http:// ou https://."
+  if [[ -n "$TELEGRAM_BOT_TOKEN" && -z "$TELEGRAM_CHAT_ID" ]] || [[ -z "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+    die "Defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID juntos, ou nenhum dos dois."
+  fi
+  local dependency
+  for dependency in curl jq; do
+    command -v "$dependency" >/dev/null || die "Dependência ausente: $dependency."
+  done
+}
+
+# ——— Utilitários ———
+log() {
+  local level="$1"
+  shift
+  printf '%s [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$*" >&2
+}
+
+die() {
+  log ERROR "$*"
+  exit 1
+}
+
+telegram_enabled() {
+  [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]
+}
+
+# Em containers LXC do Proxmox, a raiz é um volume chamado subvol-<CTID>-disk-N ou vm-<CTID>-disk-N.
+detect_proxmox_ctid() {
+  command -v findmnt >/dev/null || return 0
+  { findmnt -n -o SOURCE / 2>/dev/null || true; } | sed -En 's#.*(vm|subvol)-([0-9]+)-.*#\2#p' | head -n1
+}
+
+node_label() {
+  if [[ -n "$PROXMOX_CTID" ]]; then
+    printf '%s (CT %s)' "$NODE_NAME" "$PROXMOX_CTID"
+  else
+    printf '%s' "$NODE_NAME"
+  fi
+}
+
+# 5137025024 -> "4.8 GB"
+format_bytes() {
+  awk -v bytes="${1:-0}" 'BEGIN {
+    split("B KB MB GB TB", units, " ")
+    value = bytes + 0; unit = 1
+    while (value >= 1024 && unit < 5) { value /= 1024; unit++ }
+    if (unit == 1) printf "%d %s", value, units[unit]
+    else printf "%.1f %s", value, units[unit]
+  }'
+}
+
+# Quanto do modelo está na GPU, no mesmo estilo do `ollama ps`: "100% GPU", "100% CPU" ou "38%/62% CPU/GPU".
+processor_split() {
+  local size="${1:-0}" vram="${2:-0}"
+  if ((size <= 0 || vram <= 0)); then
+    printf '100%% CPU'
+  elif ((vram >= size)); then
+    printf '100%% GPU'
+  else
+    local gpu=$((vram * 100 / size))
+    printf '%d%%/%d%% CPU/GPU' "$((100 - gpu))" "$gpu"
+  fi
+}
+
+html_escape() {
+  local text="$1"
+  text="${text//&/&amp;}"
+  text="${text//</&lt;}"
+  text="${text//>/&gt;}"
+  printf '%s' "$text"
+}
+
+# ——— Ollama ———
+# Busca /api/ps e devolve um array JSON normalizado, ordenado pelo nome. Falha se a API não responder.
+fetch_models() {
+  local response
+  response="$(http_get "${OLLAMA_URL%/}/api/ps")" || return 1
+  normalize_models <<<"$response"
+}
+
+normalize_models() {
+  jq -ce '
+    [(.models // [])[] | {
+      name: (.name // .model),
+      size: (.size // 0),
+      size_vram: (.size_vram // 0),
+      parameter_size: (.details.parameter_size // ""),
+      quantization: (.details.quantization_level // ""),
+      expires_at: (.expires_at // "")
+    }] | sort_by(.name)'
+}
+
+http_get() {
+  curl --fail --silent --show-error --max-time "$REQUEST_TIMEOUT" "$1"
+}
+
+# ——— Telegram ———
+notify() {
+  local message="$1"
+  log INFO "Notificação: ${message//$'\n'/ | }"
+  telegram_enabled || return 0
+  local attempt
+  for attempt in 1 2; do
+    if send_telegram "$message"; then
+      return 0
+    fi
+    log WARN "Falha ao enviar ao Telegram (tentativa $attempt)."
+    sleep "$attempt"
+  done
+  log ERROR "Mensagem não enviada ao Telegram."
+  return 0
+}
+
+send_telegram() {
+  # O token vai na URL da API; nunca é escrito no log.
+  curl --fail --silent --show-error --max-time "$REQUEST_TIMEOUT" --output /dev/null \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "disable_web_page_preview=true" \
+    --data-urlencode "text=$1" \
+    "${TELEGRAM_API_URL%/}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" 2>/dev/null
+}
+
+message_loaded() {
+  local model="$1" name size vram params quant expires
+  name="$(jq -r '.name' <<<"$model")"
+  size="$(jq -r '.size' <<<"$model")"
+  vram="$(jq -r '.size_vram' <<<"$model")"
+  params="$(jq -r '.parameter_size' <<<"$model")"
+  quant="$(jq -r '.quantization' <<<"$model")"
+  expires="$(jq -r '.expires_at' <<<"$model")"
+
+  printf '🟢 <b>Modelo carregado</b>\n'
+  printf '📌 <code>%s</code>' "$(html_escape "$name")"
+  [[ -n "$params" ]] && printf ' · %s' "$(html_escape "$params")"
+  [[ -n "$quant" ]] && printf ' · %s' "$(html_escape "$quant")"
+  printf '\n📦 %s · %s\n' "$(format_bytes "$size")" "$(processor_split "$size" "$vram")"
+  [[ -n "$expires" ]] && printf '⏳ Descarrega em: %s\n' "$(html_escape "$expires")"
+  printf '🖥️ %s' "$(html_escape "$(node_label)")"
+}
+
+message_unloaded() {
+  local name
+  name="$(jq -r '.name' <<<"$1")"
+  printf '🔴 <b>Modelo descarregado</b>\n📌 <code>%s</code>\n🖥️ %s' \
+    "$(html_escape "$name")" "$(html_escape "$(node_label)")"
+}
+
+message_started() {
+  local models="$1" count names
+  count="$(jq 'length' <<<"$models")"
+  printf '▶️ <b>Monitor iniciado</b>\n🖥️ %s\n' "$(html_escape "$(node_label)")"
+  if ((count == 0)); then
+    printf '📭 Nenhum modelo carregado.'
+  else
+    names="$(jq -r 'map(.name) | join(", ")' <<<"$models")"
+    printf '📚 %d modelo(s) carregado(s): <code>%s</code>' "$count" "$(html_escape "$names")"
+  fi
+}
+
+# ——— Estado ———
+state_file() {
+  printf '%s/state.json' "$STATE_DIR"
+}
+
+read_state() {
+  local file
+  file="$(state_file)"
+  if [[ -s "$file" ]] && jq -e 'has("api_up") and has("models")' "$file" >/dev/null 2>&1; then
+    cat "$file"
+  fi
+}
+
+# Grava em arquivo temporário e renomeia: o estado nunca fica pela metade.
+write_atomic() {
+  local target="$1" content="$2" tmp
+  mkdir -p "$(dirname "$target")"
+  tmp="$(mktemp "${target}.XXXXXX")"
+  printf '%s\n' "$content" >"$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$target"
+}
+
+write_state() {
+  local api_up="$1" models="$2"
+  write_atomic "$(state_file)" "$(jq -cn --argjson up "$api_up" --argjson models "$models" '{api_up: $up, models: $models}')"
+}
+
+# ——— Métricas (formato texto do Prometheus) ———
+prometheus_label() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "${value//$'\n'/\\n}"
+}
+
+render_metrics() {
+  local api_up="$1" models="$2" node
+  node="$(prometheus_label "$NODE_NAME")"
+  cat <<EOF
+# HELP ollama_up Se a API do Ollama respondeu na última verificação (1) ou não (0).
+# TYPE ollama_up gauge
+ollama_up{node="$node"} $api_up
+# HELP ollama_models_loaded Quantidade de modelos carregados em memória.
+# TYPE ollama_models_loaded gauge
+ollama_models_loaded{node="$node"} $(jq 'length' <<<"$models")
+# HELP ollama_model_size_bytes Memória total usada pelo modelo.
+# TYPE ollama_model_size_bytes gauge
+# HELP ollama_model_vram_bytes Parte do modelo carregada na GPU.
+# TYPE ollama_model_vram_bytes gauge
+EOF
+  local name size vram
+  while IFS=$'\t' read -r name size vram; do
+    [[ -n "$name" ]] || continue
+    name="$(prometheus_label "$name")"
+    printf 'ollama_model_size_bytes{node="%s",model="%s"} %s\n' "$node" "$name" "$size"
+    printf 'ollama_model_vram_bytes{node="%s",model="%s"} %s\n' "$node" "$name" "$vram"
+  done < <(jq -r '.[] | [.name, .size, .size_vram] | @tsv' <<<"$models")
+  cat <<EOF
+# HELP ollama_monitor_last_poll_timestamp_seconds Momento da última verificação.
+# TYPE ollama_monitor_last_poll_timestamp_seconds gauge
+ollama_monitor_last_poll_timestamp_seconds{node="$node"} $(date +%s)
+EOF
+}
+
+write_metrics() {
+  [[ -n "$METRICS_FILE" ]] || return 0
+  write_atomic "$METRICS_FILE" "$(render_metrics "$@")"
+}
+
+# ——— Ciclo de verificação ———
+# Nomes presentes em $1 e ausentes em $2, como array JSON de modelos de $1.
+models_missing_from() {
+  jq -c --argjson other "$2" '[.[] | select(.name as $n | ($other | map(.name) | index($n)) | not)]' <<<"$1"
+}
+
+poll_once() {
+  local previous models prev_models prev_api_up model
+  previous="$(read_state)"
+
+  if ! models="$(fetch_models)"; then
+    log WARN "Ollama não respondeu em ${OLLAMA_URL}."
+    prev_models="[]"
+    [[ -n "$previous" ]] && prev_models="$(jq -c '.models' <<<"$previous")"
+    if [[ -z "$previous" ]] || [[ "$(jq -r '.api_up' <<<"$previous")" == "true" ]]; then
+      if [[ "$NOTIFY_API_DOWN" == "true" ]]; then
+        notify "⚠️ <b>Ollama indisponível</b>
+🔗 $(html_escape "$OLLAMA_URL")
+🖥️ $(html_escape "$(node_label)")"
+      fi
+    fi
+    write_state false "$prev_models"
+    write_metrics 0 "[]"
+    return 0
+  fi
+
+  if [[ -z "$previous" ]]; then
+    notify "$(message_started "$models")"
+  else
+    prev_api_up="$(jq -r '.api_up' <<<"$previous")"
+    prev_models="$(jq -c '.models' <<<"$previous")"
+    if [[ "$prev_api_up" == "false" && "$NOTIFY_API_DOWN" == "true" ]]; then
+      notify "✅ <b>Ollama voltou a responder</b>
+🖥️ $(html_escape "$(node_label)")"
+    fi
+    while IFS= read -r model; do
+      [[ -n "$model" ]] && notify "$(message_loaded "$model")"
+    done < <(models_missing_from "$models" "$prev_models" | jq -c '.[]')
+    while IFS= read -r model; do
+      [[ -n "$model" ]] && notify "$(message_unloaded "$model")"
+    done < <(models_missing_from "$prev_models" "$models" | jq -c '.[]')
+  fi
+
+  write_state true "$models"
+  write_metrics 1 "$models"
+}
+
+usage() {
+  cat <<'EOF'
+Uso: ollama-node-monitor [opções]
+
+Avisa no Telegram quando modelos do Ollama são carregados ou descarregados e,
+opcionalmente, exporta métricas para o Prometheus.
+
+Opções:
+  --once           Faz uma verificação e sai (útil para cron e testes).
+  --config ARQ     Carrega variáveis de um arquivo (formato CHAVE=valor).
+  --version        Mostra a versão.
+  -h, --help       Mostra esta ajuda.
+
+Configuração por variáveis de ambiente: OLLAMA_URL, POLL_INTERVAL, TELEGRAM_BOT_TOKEN,
+TELEGRAM_CHAT_ID, NODE_NAME, STATE_DIR, METRICS_FILE, NOTIFY_API_DOWN, PROXMOX_CTID.
+Veja config.env.example.
+EOF
+}
+
+main() {
+  local once=false
+  while (($#)); do
+    case "$1" in
+      --once) once=true ;;
+      --config)
+        [[ $# -ge 2 ]] || die "--config precisa de um arquivo."
+        [[ -r "$2" ]] || die "Arquivo de configuração não encontrado: $2"
+        set -a
+        # shellcheck source=/dev/null
+        source "$2"
+        set +a
+        shift
+        ;;
+      --version) printf 'ollama-node-monitor %s\n' "$VERSION"; return 0 ;;
+      -h | --help) usage; return 0 ;;
+      *) usage >&2; die "Opção desconhecida: $1" ;;
+    esac
+    shift
+  done
+
+  load_defaults
+  validate_config
+  mkdir -p "$STATE_DIR"
+  telegram_enabled || log WARN "Telegram não configurado: as notificações só vão para o log."
+
+  if [[ "$once" == true ]]; then
+    poll_once
+    return 0
+  fi
+
+  log INFO "Monitorando ${OLLAMA_URL} a cada ${POLL_INTERVAL}s em $(node_label)."
+  trap 'log INFO "Encerrando."; exit 0' TERM INT
+  while true; do
+    poll_once || log ERROR "Falha inesperada na verificação; tentando de novo no próximo ciclo."
+    # sleep em segundo plano + wait: o processo responde ao SIGTERM na hora.
+    sleep "$POLL_INTERVAL" &
+    wait $! || true
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
