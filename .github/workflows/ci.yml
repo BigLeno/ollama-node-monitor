@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: shellcheck
-        run: shellcheck --version && shellcheck bin/ollama-node-monitor tests/*.bats
+        run: shellcheck --version && shellcheck -x -P SCRIPTDIR bin/ollama-node-monitor tests/*.bats
       - name: hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:

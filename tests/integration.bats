@@ -100,5 +100,6 @@ CFG
   sleep 1
   kill -TERM "$pid"
   for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-  ! kill -0 "$pid" 2>/dev/null
+  run kill -0 "$pid"
+  [ "$status" -ne 0 ]
 }

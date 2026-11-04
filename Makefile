@@ -29,7 +29,7 @@ uninstall:
 	@echo "Removido. A configuração em $(CONFIG_DIR) foi mantida."
 
 lint:
-	shellcheck bin/ollama-node-monitor tests/*.bats
+	shellcheck -x -P SCRIPTDIR bin/ollama-node-monitor tests/*.bats
 
 test: test-unit test-integration
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 # Testes das funções do monitor, sem rede: http_get e send_telegram são substituídas.
+# shellcheck disable=SC2317  # as funções falsas são chamadas indiretamente pelo script testado
 
 setup() {
   # shellcheck source=../bin/ollama-node-monitor
@@ -109,7 +110,7 @@ poll_with() {
 }
 
 @test "NOTIFY_API_DOWN=false silencia os avisos de indisponibilidade" {
-  NOTIFY_API_DOWN=false
+  export NOTIFY_API_DOWN=false
   poll_with "$FIXTURES/ps_llama.json"
   : >"$SENT"
   poll_with ""
