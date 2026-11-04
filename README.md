@@ -1,208 +1,131 @@
-# Guia de Monitoramento de Modelos Ollama com Notificações no Telegram
+# ollama-node-monitor
 
-Este documento explica como configurar um monitor de modelos Ollama que envia notificações ao Telegram quando um modelo inicia ou para de rodar. Inclui passos para criar o script, configurar o serviço e garantir que tudo funcione automaticamente.
+[![CI](https://github.com/BigLeno/ollama-node-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/BigLeno/ollama-node-monitor/actions/workflows/ci.yml)
+![Bash](https://img.shields.io/badge/Bash-4.4%2B-4EAA25?logo=gnubash&logoColor=white)
+![systemd](https://img.shields.io/badge/systemd-hardened-30D475)
+![Prometheus](https://img.shields.io/badge/Prometheus-métricas-E6522C?logo=prometheus&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
 
----
+Monitor leve para servidores com [Ollama](https://ollama.com): avisa no **Telegram** quando modelos são
+carregados ou descarregados da memória, quando a API cai e quando volta, e exporta **métricas para o
+Prometheus**. Roda como serviço **systemd** endurecido ou em **container**, em qualquer Linux, inclusive
+em containers LXC do Proxmox, onde identifica o CTID sozinho.
 
-## 1. Requisitos
-
-- Sistema Linux com suporte ao systemd.
-- `curl` instalado.
-- `ollama` instalado e acessível no caminho `/usr/local/bin/ollama`.
-- Token do seu Bot Telegram.
-- ID do chat no Telegram onde deseja receber as notificações.
-
----
-
-## 2. Configuração do Script
-
-### a. Obtenção do token do Telegram
-
-Salve seu token, por exemplo:
-
-```bash
-TOKEN="SEU_TOKEN_AQUI"
+```
+🟢 Modelo carregado                       🔴 Modelo descarregado
+📌 qwen2.5:7b · 7.6B · Q4_K_M             📌 llama3.2:3b
+📦 5.6 GB · 40%/60% CPU/GPU               🖥️ gpu-01 (CT 105)
+⏳ Descarrega em: 2026-11-04T20:06:00-03:00
+🖥️ gpu-01 (CT 105)
 ```
 
-### b. Caminho do `ollama`
+## Como funciona
 
-Verifique o caminho do `ollama` com:
-
-```bash
-which ollama
+```mermaid
+flowchart LR
+    O["Ollama<br/>GET /api/ps"] -->|JSON| M["ollama-node-monitor<br/>compara com o estado anterior"]
+    M -->|carregou, descarregou, caiu, voltou| T["Telegram"]
+    M -->|state.json, escrita atômica| S[("/var/lib/ollama-node-monitor")]
+    M -->|ollama.prom| N["node_exporter<br/>textfile collector"] --> P["Prometheus + alertas"]
 ```
 
-Use caminho completo na variável `OLLAMA` no script.
+A cada intervalo, o monitor consulta a API HTTP do Ollama (`/api/ps`), compara os modelos carregados
+com a verificação anterior e avisa só o que mudou. Ele acompanha vários modelos ao mesmo tempo.
 
-### c. Script completo monitor.sh
+- **Sem ruído:** na primeira execução manda um único "monitor iniciado" com o que já está carregado. A
+  queda da API é avisada uma vez, e a volta também.
+- **Resiliente:** se o Telegram falhar, tenta de novo e segue monitorando. O estado é gravado com escrita
+  atômica, e um estado corrompido é tratado como primeira execução.
+- **Seguro:** o token nunca vai para o log. O serviço roda sem privilégios, e o arquivo de configuração
+  fica com permissão `600`.
 
-Salve o seguinte conteúdo como `SEU/DIRETORIO`
+## Instalação
 
-```bash
-#!/usr/bin/env bash
-# =========================
-# Script: monitor.sh
-# Monitora modelos Ollama e notifica liga/desliga no Telegram
-# =========================
+Dependências: `bash` 4.4+, `curl` e `jq`.
 
-# ——— Configurações ———
-TOKEN="SEU_TOKEN_AQUI"
-CHAT_ID="SEU_CHAT_ID_AQUI"
-OLLAMA="/usr/local/bin/ollama"
-STATE_FILE="/tmp/modelo_estado.txt"
-LOG_FILE="/tmp/modelo_changes.log"
-
-# ——— Informações do container (Proxmox LXC) ———
-CT_NAME=$(hostname)
-CT_ID=$(findmnt -n -o SOURCE / \
-         | sed -En 's#.*(vm|subvol)-([0-9]+)-.*#\2#p')
-
-# ——— Função para enviar mensagem ao Telegram ———
-enviar_mensagem() {
-  local texto="$1"
-  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${CHAT_ID}" \
-    --data-urlencode "parse_mode=Markdown" \
-    --data-urlencode "text=${texto}" \
-    > /dev/null 2>&1
-}
-
-# ——— Inicializa o STATE_FILE se não existir ———
-if [ ! -f "$STATE_FILE" ]; then
-  echo "parado:" > "$STATE_FILE"
-fi
-
-# ——— Loop de monitoramento ———
-while true; do
-  # 1) Captura a primeira linha útil do `ollama ps`
-  saida=$($OLLAMA ps)
-  linha=$(echo "$saida" | awk 'NR>1' | grep -v '^$' | head -n1)
-
-  # 2) Define estado atual e extrai informações
-  if [ -n "$linha" ]; then
-    # Modelo ativo
-    nome=$(echo "$linha" | awk '{print $1}')
-    size=$(echo "$linha" | awk '{print $3" "$4}')
-    processor=$(echo "$linha" | awk '{print $5" "$6}')
-    until=$(echo "$linha" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}' \
-            | sed 's/ *$//')
-    current_state="ativo"
-    current_model="$nome"
-
-    # Monta mensagem de ativação
-    mensagem="🌟 Modelo ativo
-📌 Nome: \`${nome}\`
-📦 Size: \`${size}\`
-⚙️ Processor: \`${processor}\`
-⏳ Próximo término: \`${until}\`
-🏷️ Container: \`${CT_NAME}\` (CTID: \`${CT_ID}\`)"
-  else
-    # Modelo parado
-    current_state="parado"
-    mensagem="❌ Modelo desligado
-📌 Nome: \`${prev_model}\`
-🏷️ Container: \`${CT_NAME}\` (CTID: \`${CT_ID}\`)"
-    current_model=""
-  fi
-
-  # 3) Lê estado anterior do STATE_FILE
-  prev_state=$(cut -d':' -f1  < "$STATE_FILE")
-  prev_model=$(cut -d':' -f2- < "$STATE_FILE")
-
-  # 4) Se mudou o estado, notifica e registra no log
-  if [ "$current_state" != "$prev_state" ]; then
-    enviar_mensagem "$mensagem"
-    echo "${current_state}:${current_model}" > "$STATE_FILE"
-
-    if [ "$current_state" = "ativo" ]; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Ativado: ${current_model} (Size: ${size}, Processor: ${processor}, Until: ${until}, Container: ${CT_NAME}#${CT_ID})" \
-        >> "$LOG_FILE"
-    else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Desligado: ${prev_model} (Container: ${CT_NAME}#${CT_ID})" \
-        >> "$LOG_FILE"
-    fi
-  fi
-
-  # 5) Aguarda antes de checar novamente
-  sleep 30
-done
-```
-
-Lembre-se de substituir ``SEU_TOKEN_AQUI`` e ``SEU_CHAT_ID_AQUI`` pelos seus valores.
-
-## 3. Tornando o Script Executável
-
+### Como serviço systemd
 
 ```bash
-chmod +x /SEU/DIRETORIO/monitor.sh
-```
-
-## 4. Criando o Serviço Systemd
-Crie o arquivo ``/etc/systemd/system/monitor-ollama.service`` com o seguinte conteúdo:
-
-```bash
-[Unit]
-Description=Monitoramento de Modelos Ollama
-After=network.target
-
-[Service]
-ExecStart=/SEU/DIRETORIO/monitor.sh
-Restart=always
-User=seu_usuario
-Environment=PATH=/bin:/usr/bin:/usr/local/bin
-WorkingDirectory=/SEU/DIRETORIO
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### a. Ative e inicie o serviço:
-
-```bash
+git clone https://github.com/BigLeno/ollama-node-monitor.git
+cd ollama-node-monitor
+sudo make install                                   # binário, configuração e unit
+sudo nano /etc/ollama-node-monitor/config.env       # token e chat do Telegram
 sudo systemctl daemon-reload
-sudo systemctl enable monitor-ollama
-sudo systemctl start monitor-ollama
+sudo systemctl enable --now ollama-node-monitor
+journalctl -u ollama-node-monitor -f
 ```
 
-### b. Verifique o status:
+A unit usa `DynamicUser` (usuário temporário sem privilégios), `ProtectSystem=strict`,
+`NoNewPrivileges`, filtro de famílias de rede e outras proteções. A configuração é lida pelo systemd
+(`EnvironmentFile`) antes de o processo perder privilégios.
+
+### Com Docker
 
 ```bash
-sudo systemctl status monitor-ollama
+cp config.env.example .env      # preencha o Telegram
+docker compose up -d            # Ollama + monitor
+docker compose exec ollama ollama run llama3.2:1b "olá"
 ```
 
-Ele deve mostrar como ``active (running)``.
-
-## 5. Reiniciando
-
-A cada mudança no arquivo, você precisa fazer: 
+A imagem é baseada em Alpine, roda com usuário sem privilégios e é publicada no GitHub Container Registry
+a cada merge na `main`:
 
 ```bash
-chmod +x /SEU/DIRETORIO/monitor.sh
+docker run -d --network host --env-file .env ghcr.io/bigleno/ollama-node-monitor:latest
 ```
 
-Em seguida:
+### Uma verificação só (cron, scripts)
 
 ```bash
-sudo systemctl restart monitor-ollama
+ollama-node-monitor --once --config ./config.env
 ```
 
-## 5. Como funciona
+## Configuração
 
-* O script verifica a saída de ``ollama ps`` a cada 30 segundos.
-* Detecta mudança de estado (modelo iniciado ou parado).
-* Envia uma mensagem formatada no Markdown ao Telegram.
-* Não repete notificações, apenas quando há alteração de status.
+| Variável | Padrão | Descrição |
+| --- | --- | --- |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Endereço da API do Ollama |
+| `POLL_INTERVAL` | `30` | Segundos entre verificações |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | vazio | Bot e chat do Telegram; vazios, as mensagens só vão para o log |
+| `NODE_NAME` | hostname | Nome do nó nas mensagens e métricas |
+| `METRICS_FILE` | vazio | Arquivo `.prom` para o textfile collector do node_exporter |
+| `NOTIFY_API_DOWN` | `true` | Avisar quando a API cair e voltar |
+| `PROXMOX_CTID` | detectado | CTID do container LXC no Proxmox |
+| `STATE_DIR` | `/var/lib/ollama-node-monitor` | Onde fica o estado entre verificações |
 
-## 6. Encerrando
+## Métricas
 
-Para parar o serviço:
+Com `METRICS_FILE` apontando para a pasta do textfile collector do node_exporter:
+
+| Métrica | Descrição |
+| --- | --- |
+| `ollama_up` | 1 se a API respondeu na última verificação |
+| `ollama_models_loaded` | Quantidade de modelos em memória |
+| `ollama_model_size_bytes{model}` | Memória usada por modelo |
+| `ollama_model_vram_bytes{model}` | Parte do modelo na GPU |
+| `ollama_monitor_last_poll_timestamp_seconds` | Última verificação (para detectar o monitor parado) |
+
+Há regras de alerta prontas em [`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml): Ollama
+fora do ar, monitor parado e modelo rodando parcialmente na CPU por falta de VRAM.
+
+## Testes e CI
 
 ```bash
-sudo systemctl stop monitor-ollama
+make lint   # shellcheck
+make test   # bats: 20 testes de unidade e 5 de integração
 ```
 
-Para desabilitar na inicialização:
+Os testes de integração rodam o monitor de verdade (curl, jq, arquivos) contra um servidor falso que imita
+a API do Ollama e a do Telegram.
 
-```bash
-sudo systemctl disable monitor-ollama
-```
+| Job | O que valida |
+| --- | --- |
+| `lint` | shellcheck no script e nos testes, hadolint no Dockerfile |
+| `unit` | Testes de unidade no bash 4.4, 5.1 e 5.2 |
+| `integration` | Fluxo completo contra o servidor falso |
+| `systemd` | `make install` num runner real, `systemd-analyze verify`, sobe o serviço e confere avisos, estado e que o token não vaza no journal |
+| `docker` | Build, smoke test do container, usuário sem privilégios e publicação no GHCR |
+
+## Licença
+
+[MIT](LICENSE)

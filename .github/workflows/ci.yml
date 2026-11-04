@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/bigleno/ollama-node-monitor
+  BATS_VERSION: v1.11.1
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: shellcheck --version && shellcheck bin/ollama-node-monitor tests/*.bats
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  unit:
+    name: unit (bash ${{ matrix.bash }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        bash: ["4.4", "5.1", "5.2"]
+    steps:
+      - uses: actions/checkout@v5
+      # As imagens bash:X são Alpine; as actions em JavaScript não rodam nelas, então o teste roda via docker run.
+      - name: bats na imagem bash:${{ matrix.bash }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e BATS_VERSION "bash:${{ matrix.bash }}" bash -c '
+            set -e
+            apk add --no-cache curl jq git >/dev/null
+            echo "bash $BASH_VERSION"
+            git clone -q --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core /tmp/bats
+            /tmp/bats/bin/bats tests/unit.bats'
+
+
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: bats
+        run: |
+          git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core /tmp/bats
+          /tmp/bats/bin/bats tests/integration.bats
+
+  systemd:
+    name: systemd (instalação e serviço reais)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Servidor falso (Ollama + Telegram)
+        run: |
+          cp tests/fixtures/ps_llama.json /tmp/ps.json
+          python3 tests/fake_server.py 18080 /tmp/ps.json /tmp/messages.jsonl &
+          sleep 1
+      - name: make install
+        run: |
+          sudo make install
+          sudo tee /etc/ollama-node-monitor/config.env >/dev/null <<'CFG'
+          OLLAMA_URL=http://127.0.0.1:18080
+          POLL_INTERVAL=2
+          TELEGRAM_API_URL=http://127.0.0.1:18080
+          TELEGRAM_BOT_TOKEN=1:ci
+          TELEGRAM_CHAT_ID=1
+          NODE_NAME=runner
+          CFG
+          sudo systemd-analyze verify /etc/systemd/system/ollama-node-monitor.service
+      - name: Subir o serviço e conferir o comportamento
+        run: |
+          sudo systemctl daemon-reload
+          sudo systemctl start ollama-node-monitor
+          for i in $(seq 1 20); do grep -q "Monitor iniciado" /tmp/messages.jsonl 2>/dev/null && break; sleep 1; done
+          grep -q "Monitor iniciado" /tmp/messages.jsonl
+
+          cp tests/fixtures/ps_two.json /tmp/ps.json
+          for i in $(seq 1 20); do grep -q "qwen2.5:7b" /tmp/messages.jsonl && break; sleep 1; done
+          grep -q "Modelo carregado" /tmp/messages.jsonl
+          grep -q "qwen2.5:7b" /tmp/messages.jsonl
+
+          test "$(systemctl show -p ActiveState --value ollama-node-monitor)" = active
+          sudo test -f /var/lib/ollama-node-monitor/state.json
+          if sudo journalctl -u ollama-node-monitor --no-pager | grep -q "1:ci"; then
+            echo "O token apareceu no log do serviço"; exit 1
+          fi
+      - name: Nota de segurança do systemd
+        run: systemd-analyze security ollama-node-monitor --no-pager | tail -n 1
+      - name: Logs do serviço
+        if: always()
+        run: sudo journalctl -u ollama-node-monitor --no-pager | tail -n 50
+
+  docker:
+    runs-on: ubuntu-24.04
+    needs: [lint, unit, integration]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test do container
+        run: |
+          cp tests/fixtures/ps_llama.json /tmp/ps.json
+          python3 tests/fake_server.py 18080 /tmp/ps.json /tmp/messages.jsonl &
+          sleep 1
+          docker run --rm --network host \
+            -e OLLAMA_URL=http://127.0.0.1:18080 -e TELEGRAM_API_URL=http://127.0.0.1:18080 \
+            -e TELEGRAM_BOT_TOKEN=1:ci -e TELEGRAM_CHAT_ID=1 -e NODE_NAME=container \
+            ${{ env.IMAGE }}:ci --once
+          grep -q "Monitor iniciado" /tmp/messages.jsonl
+          test "$(docker run --rm --entrypoint id ${{ env.IMAGE }}:ci -u)" = 10001
+      - name: Login no GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publicar a imagem
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha

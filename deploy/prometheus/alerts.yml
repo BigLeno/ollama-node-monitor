@@ -1,0 +1,27 @@
+# Regras de alerta de exemplo para o Prometheus, usando as métricas do ollama-node-monitor.
+groups:
+  - name: ollama
+    rules:
+      - alert: OllamaIndisponivel
+        expr: ollama_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ollama não responde em {{ $labels.node }}"
+
+      - alert: OllamaMonitorParado
+        expr: time() - ollama_monitor_last_poll_timestamp_seconds > 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "O monitor não atualiza as métricas de {{ $labels.node }} há mais de 5 minutos"
+
+      - alert: OllamaModeloNaCPU
+        expr: ollama_model_vram_bytes < ollama_model_size_bytes
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.model }} está parcialmente na CPU em {{ $labels.node }} (falta VRAM)"

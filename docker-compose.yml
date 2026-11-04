@@ -1,0 +1,40 @@
+# Ollama + monitor. Uso:
+#   cp config.env.example .env   (preencha o Telegram)
+#   docker compose up -d
+#   docker compose exec ollama ollama run llama3.2:1b "oi"   -> chega o aviso de modelo carregado
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    # Com GPU NVIDIA (requer nvidia-container-toolkit), descomente:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  monitor:
+    build: .
+    image: ghcr.io/bigleno/ollama-node-monitor:local
+    env_file: .env
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      NODE_NAME: ${NODE_NAME:-docker}
+      METRICS_FILE: /metrics/ollama.prom
+    volumes:
+      - state:/var/lib/ollama-node-monitor
+      - metrics:/metrics
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama:
+  state:
+  metrics:
